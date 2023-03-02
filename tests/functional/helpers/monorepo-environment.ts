@@ -17,16 +17,13 @@ import { debug, knownKeysOf } from './utils';
  * @property packages - The known packages within this repo (including the
  * root).
  * @property workspaces - The known workspaces within this repo.
- * @property today - The date that will be used for new releases. Will be
- * translated to the TODAY environment variables.
  */
-export interface MonorepoEnvironmentOptions<
+export type MonorepoEnvironmentOptions<
   WorkspacePackageNickname extends string,
-> extends EnvironmentOptions {
+> = {
   packages: Record<WorkspacePackageNickname, PackageSpecification>;
   workspaces: Record<string, string[]>;
-  today?: Date;
-}
+} & EnvironmentOptions;
 
 /**
  * The release specification data.
@@ -34,9 +31,9 @@ export interface MonorepoEnvironmentOptions<
  * @property packages - The workspace packages within this repo that will be
  * released.
  */
-interface ReleaseSpecification<WorkspacePackageNickname extends string> {
+type ReleaseSpecification<WorkspacePackageNickname extends string> = {
   packages: Partial<Record<WorkspacePackageNickname, string>>;
-}
+};
 
 /**
  * This class configures the environment such that the "local" repo becomes a
@@ -55,15 +52,9 @@ export default class MonorepoEnvironment<
 
   #packages: MonorepoEnvironmentOptions<WorkspacePackageNickname>['packages'];
 
-  #today: MonorepoEnvironmentOptions<WorkspacePackageNickname>['today'];
-
-  constructor({
-    today,
-    ...rest
-  }: MonorepoEnvironmentOptions<WorkspacePackageNickname>) {
-    super(rest);
-    this.#packages = rest.packages;
-    this.#today = today;
+  constructor(options: MonorepoEnvironmentOptions<WorkspacePackageNickname>) {
+    super(options);
+    this.#packages = options.packages;
     this.readFileWithinPackage = this.localRepo.readFileWithinPackage.bind(
       this.localRepo,
     );
@@ -82,6 +73,7 @@ export default class MonorepoEnvironment<
    * continuing.
    *
    * @param args - The arguments to this function.
+   * @param args.args - Additional arguments to pass to the command.
    * @param args.releaseSpecification - An object which specifies which packages
    * should be bumped, where keys are the *nicknames* of packages as specified
    * in the set of options passed to `withMonorepoProjectEnvironment`. Will be
@@ -89,8 +81,10 @@ export default class MonorepoEnvironment<
    * @returns The result of the command.
    */
   async runTool({
+    args: additionalArgs = [],
     releaseSpecification: releaseSpecificationWithPackageNicknames,
   }: {
+    args?: string[];
     releaseSpecification: ReleaseSpecification<WorkspacePackageNickname>;
   }): Promise<ExecaReturnValue<string>> {
     const releaseSpecificationPath = path.join(
@@ -131,25 +125,19 @@ cat "${releaseSpecificationPath}" > "$1"
     );
     await fs.promises.chmod(releaseSpecificationEditorPath, 0o777);
 
+    const args = [
+      '--transpileOnly',
+      TOOL_EXECUTABLE_PATH,
+      '--project-directory',
+      this.localRepo.getWorkingDirectoryPath(),
+      '--temp-directory',
+      this.tempDirectoryPath,
+      ...additionalArgs,
+    ];
     const env = {
       EDITOR: releaseSpecificationEditorPath,
-      ...(this.#today === undefined
-        ? {}
-        : { TODAY: this.#today.toISOString().replace(/T.+$/u, '') }),
     };
-
-    const result = await this.localRepo.runCommand(
-      TS_NODE_PATH,
-      [
-        '--transpileOnly',
-        TOOL_EXECUTABLE_PATH,
-        '--project-directory',
-        this.localRepo.getWorkingDirectoryPath(),
-        '--temp-directory',
-        path.join(this.localRepo.getWorkingDirectoryPath(), 'tmp'),
-      ],
-      { env },
-    );
+    const result = await this.localRepo.runCommand(TS_NODE_PATH, args, { env });
 
     debug(
       ['---- START OUTPUT -----', result.all, '---- END OUTPUT -----'].join(

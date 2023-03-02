@@ -1,8 +1,9 @@
 # @metamask/create-release-branch
 
-This is an interactive command-line tool that automates steps involved in preparing for a new release of a project. These steps include updating versions of one or more desired packages, adding a new section to said packages' changelogs which includes changes since the previous releases, and then creating a new branch from which a pull request can be submitted for review before the release goes live.
+This is an interactive command-line tool that automates steps involved in preparing a new release of a project. These steps include updating versions of one or more desired packages, adding a new section to the packages' changelogs to include changes since the previous release, and then creating a new branch from which a pull request can be submitted for review before the release goes live.
 
-> <table><tr><td><p align="center"><b>⚠️ HEADS UP ⚠️</b></p><div align="center">This tool is under development. We don't recommend you use this for any projects just yet.</div></td></tr></table>
+> **Note**  
+> At the moment, this tool only supports monorepos that use an independent versioning strategy. Support for other types of projects is planned in a future release.
 
 ## Installation
 
@@ -72,6 +73,6 @@ The project follows the same release process as the other libraries in the MetaM
 
 7. Publish the release on npm.
 
-   - Be very careful to use a clean local environment to publish the release, and follow exactly the same steps used during CI.
-   - Use `npm publish --dry-run` to examine the release contents to ensure the correct files are included. Compare to previous releases if necessary (e.g. using `https://unpkg.com/browse/[package name]@[package version]/`).
-   - Once you are confident the release contents are correct, publish the release using `npm publish`.
+   - Wait for the `publish-release` GitHub Action workflow to finish. This should trigger a second job (`publish-npm`), which will wait for a run approval by the [`npm publishers`](https://github.com/orgs/MetaMask/teams/npm-publishers) team.
+   - Approve the `publish-npm` job (or ask somebody on the npm publishers team to approve it for you).
+   - Once the `publish-npm` job has finished, check npm to verify that it has been published.

@@ -1,7 +1,11 @@
 import os from 'os';
 import path from 'path';
 import { when } from 'jest-when';
-import { buildMockProject, buildMockPackage } from '../tests/unit/helpers';
+import {
+  buildMockProject,
+  buildMockPackage,
+  createNoopWriteStream,
+} from '../tests/unit/helpers';
 import { determineInitialParameters } from './initial-parameters';
 import * as commandLineArgumentsModule from './command-line-arguments';
 import * as envModule from './env';
@@ -23,30 +27,33 @@ describe('initial-parameters', () => {
 
     it('returns an object derived from command-line arguments and environment variables that contains data necessary to run the workflow', async () => {
       const project = buildMockProject();
+      const stderr = createNoopWriteStream();
       when(jest.spyOn(commandLineArgumentsModule, 'readCommandLineArguments'))
         .calledWith(['arg1', 'arg2'])
         .mockResolvedValue({
           projectDirectory: '/path/to/project',
           tempDirectory: '/path/to/temp',
           reset: true,
+          backport: false,
         });
       jest
         .spyOn(envModule, 'getEnvironmentVariables')
-        .mockReturnValue({ TODAY: '2022-06-22', EDITOR: undefined });
+        .mockReturnValue({ EDITOR: undefined });
       when(jest.spyOn(projectModule, 'readProject'))
-        .calledWith('/path/to/project')
+        .calledWith('/path/to/project', { stderr })
         .mockResolvedValue(project);
 
-      const config = await determineInitialParameters(
-        ['arg1', 'arg2'],
-        '/path/to/somewhere',
-      );
+      const initialParameters = await determineInitialParameters({
+        argv: ['arg1', 'arg2'],
+        cwd: '/path/to/somewhere',
+        stderr,
+      });
 
-      expect(config).toStrictEqual({
+      expect(initialParameters).toStrictEqual({
         project,
         tempDirectoryPath: '/path/to/temp',
         reset: true,
-        today: new Date('2022-06-22'),
+        releaseType: 'ordinary',
       });
     });
 
@@ -54,127 +61,197 @@ describe('initial-parameters', () => {
       const project = buildMockProject({
         rootPackage: buildMockPackage(),
       });
+      const stderr = createNoopWriteStream();
       when(jest.spyOn(commandLineArgumentsModule, 'readCommandLineArguments'))
         .calledWith(['arg1', 'arg2'])
         .mockResolvedValue({
           projectDirectory: 'project',
           tempDirectory: undefined,
           reset: true,
+          backport: false,
         });
       jest
         .spyOn(envModule, 'getEnvironmentVariables')
-        .mockReturnValue({ TODAY: undefined, EDITOR: undefined });
+        .mockReturnValue({ EDITOR: undefined });
       const readProjectSpy = jest
         .spyOn(projectModule, 'readProject')
         .mockResolvedValue(project);
 
-      await determineInitialParameters(['arg1', 'arg2'], '/path/to/cwd');
+      await determineInitialParameters({
+        argv: ['arg1', 'arg2'],
+        cwd: '/path/to/cwd',
+        stderr,
+      });
 
-      expect(readProjectSpy).toHaveBeenCalledWith('/path/to/cwd/project');
+      expect(readProjectSpy).toHaveBeenCalledWith('/path/to/cwd/project', {
+        stderr,
+      });
     });
 
     it('resolves the given temporary directory relative to the current working directory', async () => {
       const project = buildMockProject();
+      const stderr = createNoopWriteStream();
       when(jest.spyOn(commandLineArgumentsModule, 'readCommandLineArguments'))
         .calledWith(['arg1', 'arg2'])
         .mockResolvedValue({
           projectDirectory: '/path/to/project',
           tempDirectory: 'tmp',
           reset: true,
+          backport: false,
         });
       jest
         .spyOn(envModule, 'getEnvironmentVariables')
-        .mockReturnValue({ TODAY: undefined, EDITOR: undefined });
+        .mockReturnValue({ EDITOR: undefined });
       when(jest.spyOn(projectModule, 'readProject'))
-        .calledWith('/path/to/project')
+        .calledWith('/path/to/project', { stderr })
         .mockResolvedValue(project);
 
-      const config = await determineInitialParameters(
-        ['arg1', 'arg2'],
-        '/path/to/cwd',
-      );
+      const initialParameters = await determineInitialParameters({
+        argv: ['arg1', 'arg2'],
+        cwd: '/path/to/cwd',
+        stderr,
+      });
 
-      expect(config.tempDirectoryPath).toStrictEqual('/path/to/cwd/tmp');
+      expect(initialParameters.tempDirectoryPath).toBe('/path/to/cwd/tmp');
     });
 
     it('uses a default temporary directory based on the name of the package if no temporary directory was given', async () => {
       const project = buildMockProject({
         rootPackage: buildMockPackage('@foo/bar'),
       });
+      const stderr = createNoopWriteStream();
       when(jest.spyOn(commandLineArgumentsModule, 'readCommandLineArguments'))
         .calledWith(['arg1', 'arg2'])
         .mockResolvedValue({
           projectDirectory: '/path/to/project',
           tempDirectory: undefined,
           reset: true,
+          backport: false,
         });
       jest
         .spyOn(envModule, 'getEnvironmentVariables')
-        .mockReturnValue({ TODAY: undefined, EDITOR: undefined });
+        .mockReturnValue({ EDITOR: undefined });
       when(jest.spyOn(projectModule, 'readProject'))
-        .calledWith('/path/to/project')
+        .calledWith('/path/to/project', { stderr })
         .mockResolvedValue(project);
 
-      const config = await determineInitialParameters(
-        ['arg1', 'arg2'],
-        '/path/to/cwd',
-      );
+      const initialParameters = await determineInitialParameters({
+        argv: ['arg1', 'arg2'],
+        cwd: '/path/to/cwd',
+        stderr,
+      });
 
-      expect(config.tempDirectoryPath).toStrictEqual(
+      expect(initialParameters.tempDirectoryPath).toStrictEqual(
         path.join(os.tmpdir(), 'create-release-branch', '@foo__bar'),
       );
     });
 
-    it('uses the current date if the TODAY environment variable was not provided', async () => {
+    it('returns initial parameters including reset: true, derived from a command-line argument of "--reset true"', async () => {
       const project = buildMockProject();
-      const today = new Date('2022-01-01');
+      const stderr = createNoopWriteStream();
       when(jest.spyOn(commandLineArgumentsModule, 'readCommandLineArguments'))
         .calledWith(['arg1', 'arg2'])
         .mockResolvedValue({
           projectDirectory: '/path/to/project',
-          tempDirectory: undefined,
+          tempDirectory: '/path/to/temp',
           reset: true,
+          backport: false,
         });
       jest
         .spyOn(envModule, 'getEnvironmentVariables')
-        .mockReturnValue({ TODAY: undefined, EDITOR: undefined });
+        .mockReturnValue({ EDITOR: undefined });
       when(jest.spyOn(projectModule, 'readProject'))
-        .calledWith('/path/to/project')
+        .calledWith('/path/to/project', { stderr })
         .mockResolvedValue(project);
-      jest.setSystemTime(today);
 
-      const config = await determineInitialParameters(
-        ['arg1', 'arg2'],
-        '/path/to/cwd',
-      );
+      const initialParameters = await determineInitialParameters({
+        argv: ['arg1', 'arg2'],
+        cwd: '/path/to/somewhere',
+        stderr,
+      });
 
-      expect(config.today).toStrictEqual(today);
+      expect(initialParameters.reset).toBe(true);
     });
 
-    it('uses the current date if TODAY is not a parsable date', async () => {
+    it('returns initial parameters including reset: false, derived from a command-line argument of "--reset false"', async () => {
       const project = buildMockProject();
-      const today = new Date('2022-01-01');
+      const stderr = createNoopWriteStream();
       when(jest.spyOn(commandLineArgumentsModule, 'readCommandLineArguments'))
         .calledWith(['arg1', 'arg2'])
         .mockResolvedValue({
           projectDirectory: '/path/to/project',
-          tempDirectory: undefined,
-          reset: true,
+          tempDirectory: '/path/to/temp',
+          reset: false,
+          backport: false,
         });
       jest
         .spyOn(envModule, 'getEnvironmentVariables')
-        .mockReturnValue({ TODAY: 'asdfgdasf', EDITOR: undefined });
+        .mockReturnValue({ EDITOR: undefined });
       when(jest.spyOn(projectModule, 'readProject'))
-        .calledWith('/path/to/project')
+        .calledWith('/path/to/project', { stderr })
         .mockResolvedValue(project);
-      jest.setSystemTime(today);
 
-      const config = await determineInitialParameters(
-        ['arg1', 'arg2'],
-        '/path/to/cwd',
-      );
+      const initialParameters = await determineInitialParameters({
+        argv: ['arg1', 'arg2'],
+        cwd: '/path/to/somewhere',
+        stderr,
+      });
 
-      expect(config.today).toStrictEqual(today);
+      expect(initialParameters.reset).toBe(false);
+    });
+
+    it('returns initial parameters including a releaseType of "backport", derived from a command-line argument of "--backport true"', async () => {
+      const project = buildMockProject();
+      const stderr = createNoopWriteStream();
+      when(jest.spyOn(commandLineArgumentsModule, 'readCommandLineArguments'))
+        .calledWith(['arg1', 'arg2'])
+        .mockResolvedValue({
+          projectDirectory: '/path/to/project',
+          tempDirectory: '/path/to/temp',
+          reset: false,
+          backport: true,
+        });
+      jest
+        .spyOn(envModule, 'getEnvironmentVariables')
+        .mockReturnValue({ EDITOR: undefined });
+      when(jest.spyOn(projectModule, 'readProject'))
+        .calledWith('/path/to/project', { stderr })
+        .mockResolvedValue(project);
+
+      const initialParameters = await determineInitialParameters({
+        argv: ['arg1', 'arg2'],
+        cwd: '/path/to/somewhere',
+        stderr,
+      });
+
+      expect(initialParameters.releaseType).toBe('backport');
+    });
+
+    it('returns initial parameters including a releaseType of "ordinary", derived from a command-line argument of "--backport false"', async () => {
+      const project = buildMockProject();
+      const stderr = createNoopWriteStream();
+      when(jest.spyOn(commandLineArgumentsModule, 'readCommandLineArguments'))
+        .calledWith(['arg1', 'arg2'])
+        .mockResolvedValue({
+          projectDirectory: '/path/to/project',
+          tempDirectory: '/path/to/temp',
+          reset: false,
+          backport: false,
+        });
+      jest
+        .spyOn(envModule, 'getEnvironmentVariables')
+        .mockReturnValue({ EDITOR: undefined });
+      when(jest.spyOn(projectModule, 'readProject'))
+        .calledWith('/path/to/project', { stderr })
+        .mockResolvedValue(project);
+
+      const initialParameters = await determineInitialParameters({
+        argv: ['arg1', 'arg2'],
+        cwd: '/path/to/somewhere',
+        stderr,
+      });
+
+      expect(initialParameters.releaseType).toBe('ordinary');
     });
   });
 });

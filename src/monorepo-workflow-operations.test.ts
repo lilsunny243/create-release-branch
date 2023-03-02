@@ -7,6 +7,7 @@ import { buildMockProject, Require } from '../tests/unit/helpers';
 import { followMonorepoWorkflow } from './monorepo-workflow-operations';
 import * as editorModule from './editor';
 import type { Editor } from './editor';
+import { ReleaseType } from './initial-parameters';
 import * as releaseSpecificationModule from './release-specification';
 import type { ReleaseSpecification } from './release-specification';
 import * as releasePlanModule from './release-plan';
@@ -89,21 +90,25 @@ function buildMockReleaseSpecification({
  *
  * @param overrides - The properties you want to override in the mock release
  * plan.
- * @param overrides.releaseName - The name of the new release. For a polyrepo or
- * a monorepo with fixed versions, this will be a version string with the shape
- * `<major>.<minor>.<patch>`; for a monorepo with independent versions, this
- * will be a version string with the shape `<year>.<month>.<day>-<build
- * number>`.
- * @param overrides.packages - Information about all of the packages in the
- * project. For a polyrepo, this consists of the self-same package; for a
- * monorepo it consists of the root package and any workspace packages.
+ * @param overrides.newVersion - The new version that should be released,
+ * encompassing one or more updates to packages within the project. This is
+ * always a SemVer-compatible string, though the meaning of each number depends
+ * on the type of project. For a polyrepo package or a monorepo with fixed
+ * versions, the format of the version string is "MAJOR.MINOR.PATCH"; for a
+ * monorepo with independent versions, it is "ORDINARY.BACKPORT.0", where
+ * `BACKPORT` is used to name a release that sits between two ordinary releases,
+ * and `ORDINARY` is used to name any other (non-backport) release.
+ * @param overrides.packages - Describes how the packages in the project should
+ * be updated. For a polyrepo package, this list will only contain the package
+ * itself; for a monorepo package it will consist of the root package and any
+ * workspace packages that will be included in the release.
  * @returns The mock release specification.
  */
 function buildMockReleasePlan({
-  releaseName = 'release-name',
+  newVersion = '1.0.0',
   packages = [],
 }: Partial<ReleasePlan> = {}): ReleasePlan {
-  return { releaseName, packages };
+  return { newVersion, packages };
 }
 
 /**
@@ -141,6 +146,9 @@ function buildMockEditor({
  * throw.
  * @param args.errorUponExecutingReleasePlan - The error that
  * `executeReleasePlan` will throw.
+ * @param args.releaseVersion - The new version that the release plan will
+ * contain.
+ * @param args.releaseType - The type of release.
  * @returns Mock functions and other data that can be used in tests to make
  * assertions.
  */
@@ -152,6 +160,8 @@ async function setupFollowMonorepoWorkflow({
   errorUponValidatingReleaseSpec,
   errorUponPlanningRelease,
   errorUponExecutingReleasePlan,
+  releaseVersion = '1.0.0',
+  releaseType = 'ordinary',
 }: {
   sandbox: Sandbox;
   doesReleaseSpecFileExist: boolean;
@@ -160,6 +170,8 @@ async function setupFollowMonorepoWorkflow({
   errorUponValidatingReleaseSpec?: Error;
   errorUponPlanningRelease?: Error;
   errorUponExecutingReleasePlan?: Error;
+  releaseVersion?: string;
+  releaseType?: ReleaseType;
 }) {
   const {
     determineEditorSpy,
@@ -178,11 +190,9 @@ async function setupFollowMonorepoWorkflow({
   const releaseSpecification = buildMockReleaseSpecification({
     path: releaseSpecificationPath,
   });
-  const releaseName = 'some-release-name';
-  const releasePlan = buildMockReleasePlan({ releaseName });
+  const releasePlan = buildMockReleasePlan({ newVersion: releaseVersion });
   const projectDirectoryPath = '/path/to/project';
   const project = buildMockProject({ directoryPath: projectDirectoryPath });
-  const today = new Date();
   const stdout = new MockWritable();
   const stderr = new MockWritable();
   determineEditorSpy.mockResolvedValue(isEditorAvailable ? editor : null);
@@ -212,21 +222,29 @@ async function setupFollowMonorepoWorkflow({
 
   if (errorUponPlanningRelease) {
     when(planReleaseSpy)
-      .calledWith({ project, releaseSpecification, today })
+      .calledWith({ project, releaseSpecification, releaseType })
       .mockRejectedValue(errorUponPlanningRelease);
   } else {
     when(planReleaseSpy)
-      .calledWith({ project, releaseSpecification, today })
+      .calledWith({ project, releaseSpecification, releaseType })
       .mockResolvedValue(releasePlan);
   }
 
   if (errorUponExecutingReleasePlan) {
-    executeReleasePlanSpy.mockRejectedValue(errorUponExecutingReleasePlan);
+    when(executeReleasePlanSpy)
+      .calledWith(project, releasePlan, stderr)
+      .mockRejectedValue(errorUponExecutingReleasePlan);
   } else {
-    executeReleasePlanSpy.mockResolvedValue();
+    when(executeReleasePlanSpy)
+      .calledWith(project, releasePlan, stderr)
+      .mockResolvedValue(undefined);
   }
 
-  captureChangesInReleaseBranchSpy.mockResolvedValue();
+  when(captureChangesInReleaseBranchSpy)
+    .calledWith(projectDirectoryPath, {
+      releaseVersion,
+    })
+    .mockResolvedValue();
 
   if (doesReleaseSpecFileExist) {
     await fs.promises.writeFile(
@@ -238,15 +256,16 @@ async function setupFollowMonorepoWorkflow({
   return {
     project,
     projectDirectoryPath,
-    today,
     stdout,
     stderr,
     generateReleaseSpecificationTemplateForMonorepoSpy,
     waitForUserToEditReleaseSpecificationSpy,
+    releaseSpecification,
+    planReleaseSpy,
     executeReleasePlanSpy,
     captureChangesInReleaseBranchSpy,
     releasePlan,
-    releaseName,
+    releaseVersion,
     releaseSpecificationPath,
   };
 }
@@ -254,11 +273,74 @@ async function setupFollowMonorepoWorkflow({
 describe('monorepo-workflow-operations', () => {
   describe('followMonorepoWorkflow', () => {
     describe('when firstRemovingExistingReleaseSpecification is false, the release spec file does not already exist, and an editor is available', () => {
+      it('plans an ordinary release if given releaseType: "ordinary"', async () => {
+        await withSandbox(async (sandbox) => {
+          const {
+            project,
+            stdout,
+            stderr,
+            releaseSpecification,
+            planReleaseSpy,
+          } = await setupFollowMonorepoWorkflow({
+            sandbox,
+            doesReleaseSpecFileExist: false,
+            isEditorAvailable: true,
+            releaseType: 'ordinary',
+          });
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: false,
+            releaseType: 'ordinary',
+            stdout,
+            stderr,
+          });
+
+          expect(planReleaseSpy).toHaveBeenCalledWith({
+            project,
+            releaseSpecification,
+            releaseType: 'ordinary',
+          });
+        });
+      });
+
+      it('plans a backport release if given releaseType: "backport"', async () => {
+        await withSandbox(async (sandbox) => {
+          const {
+            project,
+            stdout,
+            stderr,
+            releaseSpecification,
+            planReleaseSpy,
+          } = await setupFollowMonorepoWorkflow({
+            sandbox,
+            doesReleaseSpecFileExist: false,
+            isEditorAvailable: true,
+            releaseType: 'backport',
+          });
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: false,
+            releaseType: 'backport',
+            stdout,
+            stderr,
+          });
+
+          expect(planReleaseSpy).toHaveBeenCalledWith({
+            project,
+            releaseSpecification,
+            releaseType: 'backport',
+          });
+        });
+      });
+
       it('attempts to execute the release spec if it was successfully edited', async () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             executeReleasePlanSpy,
@@ -273,7 +355,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -290,37 +372,36 @@ describe('monorepo-workflow-operations', () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             captureChangesInReleaseBranchSpy,
             projectDirectoryPath,
-            releaseName,
           } = await setupFollowMonorepoWorkflow({
             sandbox,
             doesReleaseSpecFileExist: false,
             isEditorAvailable: true,
+            releaseVersion: '4.38.0',
           });
 
           await followMonorepoWorkflow({
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
 
           expect(captureChangesInReleaseBranchSpy).toHaveBeenCalledWith(
             projectDirectoryPath,
-            releaseName,
+            { releaseVersion: '4.38.0' },
           );
         });
       });
 
       it('removes the release spec file after editing, validating, and executing the release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -331,7 +412,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -342,7 +423,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to execute the release spec if it was not successfully edited', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, executeReleasePlanSpy } =
+          const { project, stdout, stderr, executeReleasePlanSpy } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -355,7 +436,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -367,25 +448,20 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to create a new branch if the release spec was not successfully edited', async () => {
         await withSandbox(async (sandbox) => {
-          const {
-            project,
-            today,
-            stdout,
-            stderr,
-            captureChangesInReleaseBranchSpy,
-          } = await setupFollowMonorepoWorkflow({
-            sandbox,
-            doesReleaseSpecFileExist: false,
-            isEditorAvailable: true,
-            errorUponEditingReleaseSpec: new Error('oops'),
-          });
+          const { project, stdout, stderr, captureChangesInReleaseBranchSpy } =
+            await setupFollowMonorepoWorkflow({
+              sandbox,
+              doesReleaseSpecFileExist: false,
+              isEditorAvailable: true,
+              errorUponEditingReleaseSpec: new Error('oops'),
+            });
 
           await expect(
             followMonorepoWorkflow({
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -397,7 +473,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('removes the release spec file even if it was not successfully edited', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -410,7 +486,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -422,20 +498,21 @@ describe('monorepo-workflow-operations', () => {
 
       it('throws an error produced while editing the release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr } =
-            await setupFollowMonorepoWorkflow({
+          const { project, stdout, stderr } = await setupFollowMonorepoWorkflow(
+            {
               sandbox,
               doesReleaseSpecFileExist: false,
               isEditorAvailable: true,
               errorUponEditingReleaseSpec: new Error('oops'),
-            });
+            },
+          );
 
           await expect(
             followMonorepoWorkflow({
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -446,7 +523,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if it was successfully edited but an error is thrown while validating the release spec', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponValidatingReleaseSpec = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -459,7 +536,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -472,7 +549,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if it was successfully edited but an error is thrown while planning the release', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponPlanningRelease = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -485,7 +562,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -498,7 +575,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if it was successfully edited but an error is thrown while executing the release plan', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponExecutingReleasePlan = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -511,7 +588,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -525,7 +602,7 @@ describe('monorepo-workflow-operations', () => {
     describe('when firstRemovingExistingReleaseSpecification is false, the release spec file does not already exist, and an editor is not available', () => {
       it('does not attempt to execute the edited release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, executeReleasePlanSpy } =
+          const { project, stdout, stderr, executeReleasePlanSpy } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -536,7 +613,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -547,34 +624,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to create a new branch', async () => {
         await withSandbox(async (sandbox) => {
-          const {
-            project,
-            today,
-            stdout,
-            stderr,
-            captureChangesInReleaseBranchSpy,
-          } = await setupFollowMonorepoWorkflow({
-            sandbox,
-            doesReleaseSpecFileExist: false,
-            isEditorAvailable: false,
-          });
-
-          await followMonorepoWorkflow({
-            project,
-            tempDirectoryPath: sandbox.directoryPath,
-            firstRemovingExistingReleaseSpecification: false,
-            today,
-            stdout,
-            stderr,
-          });
-
-          expect(captureChangesInReleaseBranchSpy).not.toHaveBeenCalled();
-        });
-      });
-
-      it('prints a message', async () => {
-        await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr } =
+          const { project, stdout, stderr, captureChangesInReleaseBranchSpy } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -585,7 +635,30 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
+            stdout,
+            stderr,
+          });
+
+          expect(captureChangesInReleaseBranchSpy).not.toHaveBeenCalled();
+        });
+      });
+
+      it('prints a message', async () => {
+        await withSandbox(async (sandbox) => {
+          const { project, stdout, stderr } = await setupFollowMonorepoWorkflow(
+            {
+              sandbox,
+              doesReleaseSpecFileExist: false,
+              isEditorAvailable: false,
+            },
+          );
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: false,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -598,7 +671,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not remove the generated release spec file', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -609,7 +682,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -624,7 +697,6 @@ describe('monorepo-workflow-operations', () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             waitForUserToEditReleaseSpecificationSpy,
@@ -637,7 +709,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -648,11 +720,72 @@ describe('monorepo-workflow-operations', () => {
         });
       });
 
+      it('plans an ordinary release if given releaseType: "ordinary"', async () => {
+        await withSandbox(async (sandbox) => {
+          const {
+            project,
+            stdout,
+            stderr,
+            releaseSpecification,
+            planReleaseSpy,
+          } = await setupFollowMonorepoWorkflow({
+            sandbox,
+            doesReleaseSpecFileExist: true,
+            releaseType: 'ordinary',
+          });
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: false,
+            releaseType: 'ordinary',
+            stdout,
+            stderr,
+          });
+
+          expect(planReleaseSpy).toHaveBeenCalledWith({
+            project,
+            releaseSpecification,
+            releaseType: 'ordinary',
+          });
+        });
+      });
+
+      it('plans a backport release if given releaseType: "backport"', async () => {
+        await withSandbox(async (sandbox) => {
+          const {
+            project,
+            stdout,
+            stderr,
+            releaseSpecification,
+            planReleaseSpy,
+          } = await setupFollowMonorepoWorkflow({
+            sandbox,
+            doesReleaseSpecFileExist: true,
+            releaseType: 'backport',
+          });
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: false,
+            releaseType: 'backport',
+            stdout,
+            stderr,
+          });
+
+          expect(planReleaseSpy).toHaveBeenCalledWith({
+            project,
+            releaseSpecification,
+            releaseType: 'backport',
+          });
+        });
+      });
+
       it('attempts to execute the edited release spec', async () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             executeReleasePlanSpy,
@@ -666,7 +799,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -683,36 +816,35 @@ describe('monorepo-workflow-operations', () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             captureChangesInReleaseBranchSpy,
             projectDirectoryPath,
-            releaseName,
           } = await setupFollowMonorepoWorkflow({
             sandbox,
             doesReleaseSpecFileExist: true,
+            releaseVersion: '4.38.0',
           });
 
           await followMonorepoWorkflow({
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
 
           expect(captureChangesInReleaseBranchSpy).toHaveBeenCalledWith(
             projectDirectoryPath,
-            releaseName,
+            { releaseVersion: '4.38.0' },
           );
         });
       });
 
       it('removes the release spec file after validating and executing the release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -722,7 +854,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: false,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -734,7 +866,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if an error is thrown while validating the release spec', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponValidatingReleaseSpec = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -746,7 +878,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -759,7 +891,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if an error is thrown while planning the release', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponPlanningRelease = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -771,7 +903,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -784,7 +916,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if an error is thrown while executing the release plan', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponExecutingReleasePlan = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -796,7 +928,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: false,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -808,11 +940,74 @@ describe('monorepo-workflow-operations', () => {
     });
 
     describe('when firstRemovingExistingReleaseSpecification is true, the release spec file does not already exist, and an editor is available', () => {
+      it('plans an ordinary release if given releaseType: "ordinary"', async () => {
+        await withSandbox(async (sandbox) => {
+          const {
+            project,
+            stdout,
+            stderr,
+            releaseSpecification,
+            planReleaseSpy,
+          } = await setupFollowMonorepoWorkflow({
+            sandbox,
+            doesReleaseSpecFileExist: false,
+            isEditorAvailable: true,
+            releaseType: 'ordinary',
+          });
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: true,
+            releaseType: 'ordinary',
+            stdout,
+            stderr,
+          });
+
+          expect(planReleaseSpy).toHaveBeenCalledWith({
+            project,
+            releaseSpecification,
+            releaseType: 'ordinary',
+          });
+        });
+      });
+
+      it('plans a backport release if given releaseType: "backport"', async () => {
+        await withSandbox(async (sandbox) => {
+          const {
+            project,
+            stdout,
+            stderr,
+            releaseSpecification,
+            planReleaseSpy,
+          } = await setupFollowMonorepoWorkflow({
+            sandbox,
+            doesReleaseSpecFileExist: false,
+            isEditorAvailable: true,
+            releaseType: 'backport',
+          });
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: true,
+            releaseType: 'backport',
+            stdout,
+            stderr,
+          });
+
+          expect(planReleaseSpy).toHaveBeenCalledWith({
+            project,
+            releaseSpecification,
+            releaseType: 'backport',
+          });
+        });
+      });
+
       it('attempts to execute the release spec if it was successfully edited', async () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             executeReleasePlanSpy,
@@ -827,7 +1022,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -844,37 +1039,36 @@ describe('monorepo-workflow-operations', () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             captureChangesInReleaseBranchSpy,
             projectDirectoryPath,
-            releaseName,
           } = await setupFollowMonorepoWorkflow({
             sandbox,
             doesReleaseSpecFileExist: false,
             isEditorAvailable: true,
+            releaseVersion: '4.38.0',
           });
 
           await followMonorepoWorkflow({
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
 
           expect(captureChangesInReleaseBranchSpy).toHaveBeenCalledWith(
             projectDirectoryPath,
-            releaseName,
+            { releaseVersion: '4.38.0' },
           );
         });
       });
 
       it('removes the release spec file after editing, validating, and executing the release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -885,7 +1079,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -896,7 +1090,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to execute the release spec if it was not successfully edited', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, executeReleasePlanSpy } =
+          const { project, stdout, stderr, executeReleasePlanSpy } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -909,7 +1103,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -921,25 +1115,20 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to create a new branch if the release spec was not successfully edited', async () => {
         await withSandbox(async (sandbox) => {
-          const {
-            project,
-            today,
-            stdout,
-            stderr,
-            captureChangesInReleaseBranchSpy,
-          } = await setupFollowMonorepoWorkflow({
-            sandbox,
-            doesReleaseSpecFileExist: false,
-            isEditorAvailable: true,
-            errorUponEditingReleaseSpec: new Error('oops'),
-          });
+          const { project, stdout, stderr, captureChangesInReleaseBranchSpy } =
+            await setupFollowMonorepoWorkflow({
+              sandbox,
+              doesReleaseSpecFileExist: false,
+              isEditorAvailable: true,
+              errorUponEditingReleaseSpec: new Error('oops'),
+            });
 
           await expect(
             followMonorepoWorkflow({
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -951,7 +1140,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('removes the release spec file even if it was not successfully edited', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -964,7 +1153,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -976,20 +1165,21 @@ describe('monorepo-workflow-operations', () => {
 
       it('throws an error produced while editing the release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr } =
-            await setupFollowMonorepoWorkflow({
+          const { project, stdout, stderr } = await setupFollowMonorepoWorkflow(
+            {
               sandbox,
               doesReleaseSpecFileExist: false,
               isEditorAvailable: true,
               errorUponEditingReleaseSpec: new Error('oops'),
-            });
+            },
+          );
 
           await expect(
             followMonorepoWorkflow({
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1000,7 +1190,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if it was successfully edited but an error is thrown while validating the release spec', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponValidatingReleaseSpec = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -1013,7 +1203,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1026,7 +1216,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if it was successfully edited but an error is thrown while planning the release', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponPlanningRelease = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -1039,7 +1229,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1052,7 +1242,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if it was successfully edited but an error is thrown while executing the release plan', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponExecutingReleasePlan = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -1065,7 +1255,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1079,7 +1269,7 @@ describe('monorepo-workflow-operations', () => {
     describe('when firstRemovingExistingReleaseSpecification is true, the release spec file does not already exist, and an editor is not available', () => {
       it('does not attempt to execute the edited release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, executeReleasePlanSpy } =
+          const { project, stdout, stderr, executeReleasePlanSpy } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -1090,7 +1280,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -1101,34 +1291,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to create a new branch', async () => {
         await withSandbox(async (sandbox) => {
-          const {
-            project,
-            today,
-            stdout,
-            stderr,
-            captureChangesInReleaseBranchSpy,
-          } = await setupFollowMonorepoWorkflow({
-            sandbox,
-            doesReleaseSpecFileExist: false,
-            isEditorAvailable: false,
-          });
-
-          await followMonorepoWorkflow({
-            project,
-            tempDirectoryPath: sandbox.directoryPath,
-            firstRemovingExistingReleaseSpecification: true,
-            today,
-            stdout,
-            stderr,
-          });
-
-          expect(captureChangesInReleaseBranchSpy).not.toHaveBeenCalled();
-        });
-      });
-
-      it('prints a message', async () => {
-        await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr } =
+          const { project, stdout, stderr, captureChangesInReleaseBranchSpy } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -1139,7 +1302,30 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
+            stdout,
+            stderr,
+          });
+
+          expect(captureChangesInReleaseBranchSpy).not.toHaveBeenCalled();
+        });
+      });
+
+      it('prints a message', async () => {
+        await withSandbox(async (sandbox) => {
+          const { project, stdout, stderr } = await setupFollowMonorepoWorkflow(
+            {
+              sandbox,
+              doesReleaseSpecFileExist: false,
+              isEditorAvailable: false,
+            },
+          );
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: true,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -1152,7 +1338,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not remove the generated release spec file', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: false,
@@ -1163,7 +1349,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -1178,7 +1364,6 @@ describe('monorepo-workflow-operations', () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             generateReleaseSpecificationTemplateForMonorepoSpy,
@@ -1192,7 +1377,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -1206,11 +1391,74 @@ describe('monorepo-workflow-operations', () => {
         });
       });
 
+      it('plans an ordinary release if given releaseType: "ordinary"', async () => {
+        await withSandbox(async (sandbox) => {
+          const {
+            project,
+            stdout,
+            stderr,
+            releaseSpecification,
+            planReleaseSpy,
+          } = await setupFollowMonorepoWorkflow({
+            sandbox,
+            doesReleaseSpecFileExist: true,
+            isEditorAvailable: true,
+            releaseType: 'ordinary',
+          });
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: true,
+            releaseType: 'ordinary',
+            stdout,
+            stderr,
+          });
+
+          expect(planReleaseSpy).toHaveBeenCalledWith({
+            project,
+            releaseSpecification,
+            releaseType: 'ordinary',
+          });
+        });
+      });
+
+      it('plans a backport release if given releaseType: "backport"', async () => {
+        await withSandbox(async (sandbox) => {
+          const {
+            project,
+            stdout,
+            stderr,
+            releaseSpecification,
+            planReleaseSpy,
+          } = await setupFollowMonorepoWorkflow({
+            sandbox,
+            doesReleaseSpecFileExist: true,
+            isEditorAvailable: true,
+            releaseType: 'backport',
+          });
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: true,
+            releaseType: 'backport',
+            stdout,
+            stderr,
+          });
+
+          expect(planReleaseSpy).toHaveBeenCalledWith({
+            project,
+            releaseSpecification,
+            releaseType: 'backport',
+          });
+        });
+      });
+
       it('attempts to execute the release spec if it was successfully edited', async () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             executeReleasePlanSpy,
@@ -1225,7 +1473,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -1242,37 +1490,36 @@ describe('monorepo-workflow-operations', () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             captureChangesInReleaseBranchSpy,
             projectDirectoryPath,
-            releaseName,
           } = await setupFollowMonorepoWorkflow({
             sandbox,
             doesReleaseSpecFileExist: true,
             isEditorAvailable: true,
+            releaseVersion: '4.38.0',
           });
 
           await followMonorepoWorkflow({
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
 
           expect(captureChangesInReleaseBranchSpy).toHaveBeenCalledWith(
             projectDirectoryPath,
-            releaseName,
+            { releaseVersion: '4.38.0' },
           );
         });
       });
 
       it('removes the release spec file after editing, validating, and executing the release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -1283,7 +1530,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -1294,7 +1541,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to execute the release spec if it was not successfully edited', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, executeReleasePlanSpy } =
+          const { project, stdout, stderr, executeReleasePlanSpy } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -1307,7 +1554,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1319,25 +1566,20 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to create a new branch if the release spec was not successfully edited', async () => {
         await withSandbox(async (sandbox) => {
-          const {
-            project,
-            today,
-            stdout,
-            stderr,
-            captureChangesInReleaseBranchSpy,
-          } = await setupFollowMonorepoWorkflow({
-            sandbox,
-            doesReleaseSpecFileExist: true,
-            isEditorAvailable: true,
-            errorUponEditingReleaseSpec: new Error('oops'),
-          });
+          const { project, stdout, stderr, captureChangesInReleaseBranchSpy } =
+            await setupFollowMonorepoWorkflow({
+              sandbox,
+              doesReleaseSpecFileExist: true,
+              isEditorAvailable: true,
+              errorUponEditingReleaseSpec: new Error('oops'),
+            });
 
           await expect(
             followMonorepoWorkflow({
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1349,7 +1591,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('removes the release spec file even if it was not successfully edited', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -1362,7 +1604,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1374,20 +1616,21 @@ describe('monorepo-workflow-operations', () => {
 
       it('throws an error produced while editing the release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr } =
-            await setupFollowMonorepoWorkflow({
+          const { project, stdout, stderr } = await setupFollowMonorepoWorkflow(
+            {
               sandbox,
               doesReleaseSpecFileExist: true,
               isEditorAvailable: true,
               errorUponEditingReleaseSpec: new Error('oops'),
-            });
+            },
+          );
 
           await expect(
             followMonorepoWorkflow({
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1398,7 +1641,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if it was successfully edited but an error is thrown while validating the release spec', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponValidatingReleaseSpec = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -1411,7 +1654,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1424,7 +1667,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if it was successfully edited but an error is thrown while planning the release', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponPlanningRelease = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -1437,7 +1680,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1450,7 +1693,7 @@ describe('monorepo-workflow-operations', () => {
       it('does not remove the generated release spec file if it was successfully edited but an error is thrown while executing the release plan', async () => {
         await withSandbox(async (sandbox) => {
           const errorUponExecutingReleasePlan = new Error('oops');
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -1463,7 +1706,7 @@ describe('monorepo-workflow-operations', () => {
               project,
               tempDirectoryPath: sandbox.directoryPath,
               firstRemovingExistingReleaseSpecification: true,
-              today,
+              releaseType: 'ordinary',
               stdout,
               stderr,
             }),
@@ -1479,7 +1722,6 @@ describe('monorepo-workflow-operations', () => {
         await withSandbox(async (sandbox) => {
           const {
             project,
-            today,
             stdout,
             stderr,
             generateReleaseSpecificationTemplateForMonorepoSpy,
@@ -1493,7 +1735,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -1509,7 +1751,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to execute the edited release spec', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, executeReleasePlanSpy } =
+          const { project, stdout, stderr, executeReleasePlanSpy } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -1520,7 +1762,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -1531,34 +1773,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not attempt to create a new branch', async () => {
         await withSandbox(async (sandbox) => {
-          const {
-            project,
-            today,
-            stdout,
-            stderr,
-            captureChangesInReleaseBranchSpy,
-          } = await setupFollowMonorepoWorkflow({
-            sandbox,
-            doesReleaseSpecFileExist: true,
-            isEditorAvailable: false,
-          });
-
-          await followMonorepoWorkflow({
-            project,
-            tempDirectoryPath: sandbox.directoryPath,
-            firstRemovingExistingReleaseSpecification: true,
-            today,
-            stdout,
-            stderr,
-          });
-
-          expect(captureChangesInReleaseBranchSpy).not.toHaveBeenCalled();
-        });
-      });
-
-      it('prints a message', async () => {
-        await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr } =
+          const { project, stdout, stderr, captureChangesInReleaseBranchSpy } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -1569,7 +1784,30 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
+            stdout,
+            stderr,
+          });
+
+          expect(captureChangesInReleaseBranchSpy).not.toHaveBeenCalled();
+        });
+      });
+
+      it('prints a message', async () => {
+        await withSandbox(async (sandbox) => {
+          const { project, stdout, stderr } = await setupFollowMonorepoWorkflow(
+            {
+              sandbox,
+              doesReleaseSpecFileExist: true,
+              isEditorAvailable: false,
+            },
+          );
+
+          await followMonorepoWorkflow({
+            project,
+            tempDirectoryPath: sandbox.directoryPath,
+            firstRemovingExistingReleaseSpecification: true,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
@@ -1582,7 +1820,7 @@ describe('monorepo-workflow-operations', () => {
 
       it('does not remove the generated release spec file', async () => {
         await withSandbox(async (sandbox) => {
-          const { project, today, stdout, stderr, releaseSpecificationPath } =
+          const { project, stdout, stderr, releaseSpecificationPath } =
             await setupFollowMonorepoWorkflow({
               sandbox,
               doesReleaseSpecFileExist: true,
@@ -1593,7 +1831,7 @@ describe('monorepo-workflow-operations', () => {
             project,
             tempDirectoryPath: sandbox.directoryPath,
             firstRemovingExistingReleaseSpecification: true,
-            today,
+            releaseType: 'ordinary',
             stdout,
             stderr,
           });
